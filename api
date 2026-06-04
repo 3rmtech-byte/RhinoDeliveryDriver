@@ -1,0 +1,541 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15
+    container_name: app_db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: fieldapp
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  backend:
+    build: ./backend
+    container_name: app_backend
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgres://postgres:postgres@db:5432/fieldapp
+      - PORT=3000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./backend:/usr/src/app
+
+  frontend:
+    build: ./frontend
+    container_name: app_frontend
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  db_data:
+{
+  "name": "fieldapp-backend",
+  "version": "1.0.0",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.0",
+    "express": "^4.19.0",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.11.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  }
+}
+FROM node:20-alpine
+
+WORKDIR /usr/src/app
+
+COPY package.json package-lock.json* ./
+RUN npm install
+
+COPY . .
+
+EXPOSE 3000
+
+CMD ["npm", "start"]
+CREATE TABLE IF NOT EXISTS users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS units (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tipo TEXT NOT NULL,
+  qr_code TEXT UNIQUE,
+  estado TEXT NOT NULL,
+  ubicacion_lat DOUBLE PRECISION,
+  ubicacion_lng DOUBLE PRECISION,
+  notas TEXT,
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS jobs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tipo_servicio TEXT NOT NULL,
+  cliente TEXT NOT NULL,
+  direccion TEXT NOT NULL,
+  lat DOUBLE PRECISION,
+  lng DOUBLE PRECISION,
+  unidad_id UUID REFERENCES units(id),
+  fecha_programada TIMESTAMP NOT NULL,
+  estado TEXT NOT NULL,
+  notas TEXT,
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS job_photos (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  job_id UUID REFERENCES jobs(id),
+  url TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS offline_resources (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tipo TEXT NOT NULL,
+  version TEXT NOT NULL,
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_fecha ON jobs(fecha_programada);
+CREATE INDEX IF NOT EXISTS idx_jobs_estado ON jobs(estado);
+CREATE INDEX IF NOT EXISTS idx_units_estado ON units(estado);
+const { Pool } = require("pg");
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL
+});
+
+async function init() {
+  const fs = require("fs");
+  const path = require("path");
+  const sql = fs.readFileSync(path.join(__dirname, "config", "init.sql"), "utf8");
+  await pool.query(sql);
+  console.log("✅ DB initialized");
+}
+
+module.exports = { pool, init };
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const { init } = require("./db");
+
+const jobsRouter = require("./routes/jobs");
+const unitsRouter = require("./routes/units");
+const photosRouter = require("./routes/photos");
+const syncRouter = require("./routes/sync");
+const offlineRouter = require("./routes/offline");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(express.json());
+
+app.get("/", (req, res) => {
+  res.json({ status: "ok", message: "Field app backend running" });
+});
+
+app.use("/jobs", jobsRouter);
+app.use("/units", unitsRouter);
+app.use("/photos", photosRouter);
+app.use("/sync", syncRouter);
+app.use("/offline", offlineRouter);
+
+init()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`🚀 Backend listening on port ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("DB init error:", err);
+    process.exit(1);
+  });
+const express = require("express");
+const router = express.Router();
+const { pool } = require("../db");
+
+// GET /jobs?from=2025-01-01&to=2025-01-31&estado=pendiente
+router.get("/", async (req, res) => {
+  try {
+    const { from, to, estado } = req.query;
+    const params = [];
+    const where = [];
+
+    if (from) {
+      params.push(from);
+      where.push(`fecha_programada >= $${params.length}`);
+    }
+    if (to) {
+      params.push(to);
+      where.push(`fecha_programada <= $${params.length}`);
+    }
+    if (estado) {
+      params.push(estado);
+      where.push(`estado = $${params.length}`);
+    }
+
+    const sql = `
+      SELECT * FROM jobs
+      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      ORDER BY fecha_programada ASC
+    `;
+    const { rows } = await pool.query(sql, params);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error fetching jobs" });
+  }
+});
+
+router.post("/", async (req, res) => {
+  try {
+    const {
+      tipo_servicio,
+      cliente,
+      direccion,
+      lat,
+      lng,
+      unidad_id,
+      fecha_programada,
+      estado,
+      notas
+    } = req.body;
+
+    const sql = `
+      INSERT INTO jobs (tipo_servicio, cliente, direccion, lat, lng, unidad_id, fecha_programada, estado, notas, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+      RETURNING *
+    `;
+    const { rows } = await pool.query(sql, [
+      tipo_servicio,
+      cliente,
+      direccion,
+      lat,
+      lng,
+      unidad_id,
+      fecha_programada,
+      estado || "pendiente",
+      notas || null
+    ]);
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error creating job" });
+  }
+});
+
+router.patch("/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    for (const [key, value] of Object.entries(req.body)) {
+      fields.push(`${key} = $${idx++}`);
+      values.push(value);
+    }
+    values.push(id);
+
+    const sql = `
+      UPDATE jobs
+      SET ${fields.join(", ")}, updated_at = NOW()
+      WHERE id = $${idx}
+      RETURNING *
+    `;
+    const { rows } = await pool.query(sql, values);
+    if (!rows.length) return res.status(404).json({ error: "Job not found" });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error updating job" });
+  }
+});
+
+router.delete("/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query("DELETE FROM jobs WHERE id = $1", [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error deleting job" });
+  }
+});
+
+module.exports = router;
+const express = require("express");
+const router = express.Router();
+const { pool } = require("../db");
+
+// GET /units
+router.get("/", async (_req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM units ORDER BY tipo, estado");
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error fetching units" });
+  }
+});
+
+router.post("/", async (req, res) => {
+  try {
+    const { tipo, qr_code, estado, ubicacion_lat, ubicacion_lng, notas } = req.body;
+    const sql = `
+      INSERT INTO units (tipo, qr_code, estado, ubicacion_lat, ubicacion_lng, notas, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,NOW())
+      RETURNING *
+    `;
+    const { rows } = await pool.query(sql, [
+      tipo,
+      qr_code || null,
+      estado || "disponible",
+      ubicacion_lat || null,
+      ubicacion_lng || null,
+      notas || null
+    ]);
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error creating unit" });
+  }
+});
+
+router.patch("/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    for (const [key, value] of Object.entries(req.body)) {
+      fields.push(`${key} = $${idx++}`);
+      values.push(value);
+    }
+    values.push(id);
+
+    const sql = `
+      UPDATE units
+      SET ${fields.join(", ")}, updated_at = NOW()
+      WHERE id = $${idx}
+      RETURNING *
+    `;
+    const { rows } = await pool.query(sql, values);
+    if (!rows.length) return res.status(404).json({ error: "Unit not found" });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error updating unit" });
+  }
+});
+
+// QR scan endpoint: /units/scan
+router.post("/scan", async (req, res) => {
+  try {
+    const { qr_code, lat, lng } = req.body;
+    const sql = `
+      UPDATE units
+      SET ubicacion_lat = $1, ubicacion_lng = $2, updated_at = NOW()
+      WHERE qr_code = $3
+      RETURNING *
+    `;
+    const { rows } = await pool.query(sql, [lat, lng, qr_code]);
+    if (!rows.length) return res.status(404).json({ error: "Unit not found" });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error scanning unit" });
+  }
+});
+
+module.exports = router;
+const express = require("express");
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
+const { pool } = require("../db");
+
+const router = express.Router();
+
+const uploadDir = path.join(__dirname, "..", "..", "uploads");
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, uploadDir),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
+  }
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  fileFilter: (_req, file, cb) => {
+    const allowed = ["image/jpeg", "image/png", "image/webp"];
+    if (!allowed.includes(file.mimetype)) return cb(new Error("Invalid file type"));
+    cb(null, true);
+  }
+});
+
+router.post("/:jobId", upload.single("photo"), async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+    const url = `/uploads/${req.file.filename}`;
+    const sql = `
+      INSERT INTO job_photos (job_id, url)
+      VALUES ($1,$2)
+      RETURNING *
+    `;
+    const { rows } = await pool.query(sql, [jobId, url]);
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error uploading photo" });
+  }
+});
+
+module.exports = router;
+const express = require("express");
+const router = express.Router();
+const { pool } = require("../db");
+
+// PUSH: recibe jobs y units modificados offline
+router.post("/push", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { jobs = [], units = [] } = req.body;
+    await client.query("BEGIN");
+
+    for (const job of jobs) {
+      await client.query(
+        `
+        INSERT INTO jobs (id, tipo_servicio, cliente, direccion, lat, lng, unidad_id, fecha_programada, estado, notas, updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        ON CONFLICT (id) DO UPDATE SET
+          tipo_servicio = EXCLUDED.tipo_servicio,
+          cliente = EXCLUDED.cliente,
+          direccion = EXCLUDED.direccion,
+          lat = EXCLUDED.lat,
+          lng = EXCLUDED.lng,
+          unidad_id = EXCLUDED.unidad_id,
+          fecha_programada = EXCLUDED.fecha_programada,
+          estado = EXCLUDED.estado,
+          notas = EXCLUDED.notas,
+          updated_at = GREATEST(jobs.updated_at, EXCLUDED.updated_at)
+      `,
+        [
+          job.id,
+          job.tipo_servicio,
+          job.cliente,
+          job.direccion,
+          job.lat,
+          job.lng,
+          job.unidad_id,
+          job.fecha_programada,
+          job.estado,
+          job.notas,
+          job.updated_at
+        ]
+      );
+    }
+
+    for (const unit of units) {
+      await client.query(
+        `
+        INSERT INTO units (id, tipo, qr_code, estado, ubicacion_lat, ubicacion_lng, notas, updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        ON CONFLICT (id) DO UPDATE SET
+          tipo = EXCLUDED.tipo,
+          qr_code = EXCLUDED.qr_code,
+          estado = EXCLUDED.estado,
+          ubicacion_lat = EXCLUDED.ubicacion_lat,
+          ubicacion_lng = EXCLUDED.ubicacion_lng,
+          notas = EXCLUDED.notas,
+          updated_at = GREATEST(units.updated_at, EXCLUDED.updated_at)
+      `,
+        [
+          unit.id,
+          unit.tipo,
+          unit.qr_code,
+          unit.estado,
+          unit.ubicacion_lat,
+          unit.ubicacion_lng,
+          unit.notas,
+          unit.updated_at
+        ]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err);
+    res.status(500).json({ error: "Error in sync push" });
+  } finally {
+    client.release();
+  }
+});
+
+// PULL: devuelve cambios desde last_sync
+router.get("/pull", async (req, res) => {
+  try {
+    const { last_sync } = req.query;
+    const since = last_sync || "1970-01-01T00:00:00Z";
+
+    const [jobs, units] = await Promise.all([
+      pool.query("SELECT * FROM jobs WHERE updated_at > $1", [since]),
+      pool.query("SELECT * FROM units WHERE updated_at > $1", [since])
+    ]);
+
+    res.json({
+      jobs: jobs.rows,
+      units: units.rows,
+      server_time: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error in sync pull" });
+  }
+});
+
+module.exports = router;
+const express = require("express");
+const router = express.Router();
+const { pool } = require("../db");
+
+// Simple: devuelve versiones de recursos offline
+router.get("/resources", async (_req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM offline_resources");
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error fetching offline resources" });
+  }
+});
+
+module.exports = router;
